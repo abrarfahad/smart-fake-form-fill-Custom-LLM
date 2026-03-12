@@ -1,9 +1,14 @@
 import OpenAI from 'openai';
 import systemPrompt from './prompts/system.txt?raw';
 import {
+	CUSTOM_API_KEY_PLACEHOLDER,
+	DEFAULT_GEMINI_MODEL,
 	DEFAULT_OPENAI_MODEL,
 	DEFAULT_OPENAI_REQUEST_TIMEOUT,
+	DEFAULT_PROVIDER,
 	EXTENSION_DISPLAY_NAME,
+	GEMINI_BASE_URL,
+	GEMINI_MODELS,
 	OPENAI_REQUEST_MAX_RETRIES
 } from './scripts/config';
 import type {
@@ -11,6 +16,7 @@ import type {
 	FieldValueGetterResponse,
 	FieldValues,
 	OpenAiModelListResponse,
+	ProviderType,
 	Status,
 	StatusUpdateRequest
 } from './scripts/types';
@@ -83,19 +89,71 @@ function getStatus({
 	sendResponse({ status: currentStatus });
 }
 
+// Retrieve the current provider type from storage
+async function getProviderType(): Promise<ProviderType> {
+	const { provider } = await chrome.storage.sync.get<{ provider: ProviderType }>('provider');
+	return provider || DEFAULT_PROVIDER;
+}
+
+// Build an OpenAI client configured for the current provider
+async function buildOpenAIClient(providerType: ProviderType): Promise<OpenAI> {
+	if (providerType === 'gemini') {
+		const { gemini_api_key } = await chrome.storage.local.get<{ gemini_api_key: string }>(
+			'gemini_api_key'
+		);
+		if (!gemini_api_key) {
+			throw new Error('Google Gemini API key missing; please define it in the extension settings');
+		}
+		return new OpenAI({ apiKey: gemini_api_key, baseURL: GEMINI_BASE_URL });
+	} else if (providerType === 'custom') {
+		const { custom_base_url } = await chrome.storage.sync.get<{ custom_base_url: string }>(
+			'custom_base_url'
+		);
+		if (!custom_base_url) {
+			throw new Error('Custom API base URL missing; please define it in the extension settings');
+		}
+		const { custom_api_key } = await chrome.storage.local.get<{ custom_api_key: string }>(
+			'custom_api_key'
+		);
+		// Some local models don't require an API key; use a placeholder if not set
+		return new OpenAI({
+			apiKey: custom_api_key || CUSTOM_API_KEY_PLACEHOLDER,
+			baseURL: custom_base_url
+		});
+	} else {
+		const { openai_api_key } = await chrome.storage.local.get<{ openai_api_key: string }>(
+			'openai_api_key'
+		);
+		if (!openai_api_key) {
+			throw new Error('OpenAI API key missing; please define it in the extension settings');
+		}
+		return new OpenAI({ apiKey: openai_api_key });
+	}
+}
+
 async function getModels({
 	sendResponse
 }: {
 	sendResponse: (response: OpenAiModelListResponse) => void;
 }) {
 	try {
-		const { openai_api_key } = await chrome.storage.local.get<{ openai_api_key: string }>(
-			'openai_api_key'
-		);
-		if (!openai_api_key) {
-			throw new Error('OpenAI API key missing; please define it is the extension settings');
+		const providerType = await getProviderType();
+
+		// For custom providers, return an empty list so the user can type the
+		// model name manually in the options page
+		if (providerType === 'custom') {
+			sendResponse({ status: { code: 'SUCCESS' }, models: [] });
+			return;
 		}
-		const openai = new OpenAI({ apiKey: openai_api_key });
+
+		// For Gemini, return the hardcoded list of known Gemini models
+		if (providerType === 'gemini') {
+			sendResponse({ status: { code: 'SUCCESS' }, models: GEMINI_MODELS });
+			return;
+		}
+
+		// For OpenAI, fetch the model list from the API
+		const openai = await buildOpenAIClient(providerType);
 		const modelList = await openai.models.list();
 		const allModelIds = modelList.data.map((model) => model.id);
 		let filteredModelIds = allModelIds.filter((modelId) => MODEL_ID_PATTERN.test(modelId));
@@ -120,9 +178,7 @@ async function fetchAndPopulateFormValues({
 	sendResponse: (response?: FieldValueGetterResponse) => void;
 }) {
 	try {
-		const { openai_api_key } = await chrome.storage.local.get<{ openai_api_key: string }>(
-			'openai_api_key'
-		);
+		const providerType = await getProviderType();
 		const { custom_instructions } = await chrome.storage.sync.get<{ custom_instructions: string }>(
 			'custom_instructions'
 		);
@@ -133,13 +189,18 @@ async function fetchAndPopulateFormValues({
 				])
 			)?.openai_request_timeout_seconds ?? DEFAULT_OPENAI_REQUEST_TIMEOUT
 		);
-		if (!openai_api_key) {
-			throw new Error('OpenAI API key missing; please define it is the extension settings');
+
+		// Determine the model to use based on provider
+		const savedModel = (await chrome.storage.sync.get<{ openai_model: string }>('openai_model'))
+			?.openai_model;
+		let model: string;
+		if (providerType === 'gemini') {
+			model = savedModel || DEFAULT_GEMINI_MODEL;
+		} else {
+			model = savedModel || DEFAULT_OPENAI_MODEL;
 		}
-		const model =
-			(await chrome.storage.sync.get<{ openai_model: string }>('openai_model'))?.openai_model ||
-			DEFAULT_OPENAI_MODEL;
-		const openai = new OpenAI({ apiKey: openai_api_key });
+
+		const openai = await buildOpenAIClient(providerType);
 		console.log('model:', model);
 		console.log('system prompt:', systemPrompt);
 		if (custom_instructions) {
