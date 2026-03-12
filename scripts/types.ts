@@ -21,6 +21,8 @@ export type Status = {
 	message?: string;
 };
 
+export type ProviderType = 'openai' | 'gemini' | 'custom';
+
 export type FormFillerRequest = {
 	action: 'fillForm';
 	tabId: number | undefined;
